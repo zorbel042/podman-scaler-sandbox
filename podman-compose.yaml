@@ -1,0 +1,106 @@
+networks:
+  app-network:
+    driver: bridge
+
+services:
+  rabbitmq:
+    image: docker.io/rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ic-tester
+      RABBITMQ_DEFAULT_PASS: ic-tester
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - app-network
+
+  blob-based-event-handler:
+    build:
+      context: ./BlobBasedEventHandler
+    image: localhost/sandboxtest/blob-based-event-handler:latest
+    networks:
+      - app-network
+    depends_on:
+      - rabbitmq
+      - azurite
+    healthcheck:
+      test: ["CMD", "python", "-c", "import pika; pika.BlockingConnection(pika.ConnectionParameters('rabbitmq', 5672, credentials=pika.PlainCredentials('ic-tester', 'ic-tester')))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  keda-test-scaler:
+    build:
+      context: ./KedaTestScaler
+    image: localhost/sandboxtest/keda-test-scaler:latest
+    networks:
+      - app-network
+    volumes:
+      # Podman socket for rootless mode
+      - /run/user/1000/podman/podman.sock:/var/run/docker.sock:Z
+    depends_on:
+      - rabbitmq
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://rabbitmq:15672/api/overview', auth=('ic-tester', 'ic-tester'))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Note: If running as root podman, use this volume mount instead:
+    # volumes:
+    #   - /run/podman/podman.sock:/var/run/docker.sock:Z
+
+  blob-processor:
+    build:
+      context: ./BlobProcessor
+    image: localhost/sandboxtest/blob-processor:latest
+    networks:
+      - app-network
+    depends_on:
+      - rabbitmq
+    healthcheck:
+      test: ["CMD", "python", "-c", "import pika; pika.BlockingConnection(pika.ConnectionParameters('rabbitmq', 5672, credentials=pika.PlainCredentials('ic-tester', 'ic-tester')))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Note: To run multiple instances, use: podman-compose up --scale blob-processor=3
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    ports:
+      - "10000:10000"
+      - "10001:10001"
+      - "10002:10002"
+    volumes:
+      - azurite-data:/data:Z
+    command: azurite --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0 --location /data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:10000/devstoreaccount1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  azurite-init:
+    build:
+      context: ./azurite-init
+    image: localhost/sandboxtest/azurite-init:latest
+    networks:
+      - app-network
+    depends_on:
+      azurite:
+        condition: service_healthy
+    environment:
+      - AZURITE_CONNECTION_STRING=DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
+    restart: "no"
+
+volumes:
+  azurite-data:

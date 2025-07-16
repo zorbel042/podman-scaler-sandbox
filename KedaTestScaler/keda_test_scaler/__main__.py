@@ -1,11 +1,11 @@
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from typing import List, Any, Dict
 
-import docker  # type: ignore
 import requests
 from opentelemetry import trace  # type: ignore
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter  # type: ignore
@@ -38,11 +38,16 @@ from otel_logging import init_logging  # isort: skip
 
 logger, tracer = init_logging(SERVICE_NAME_VALUE)
 
-docker_client = docker.DockerClient(base_url="unix:///var/run/docker.sock")
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def run_podman_command(args: List[str]) -> str:
+    """Run a podman command and return the output."""
+    cmd = ["podman"] + args
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return result.stdout
+
 
 def get_queue_length() -> int:
     resp = requests.get(RABBITMQ_API, auth=(RABBITMQ_USER, RABBITMQ_PASS), timeout=5)
@@ -51,38 +56,48 @@ def get_queue_length() -> int:
     return int(data.get("messages_ready", 0))
 
 
-def list_processor_containers() -> List[docker.models.containers.Container]:  # type: ignore
-    return docker_client.containers.list(filters={"label": [f"managed-by={LABEL_MANAGED_BY}", f"role={LABEL_ROLE}"]})  # type: ignore[arg-type]
+def list_processor_containers() -> List[Dict[str, Any]]:
+    """List containers with our labels."""
+    output = run_podman_command([
+        "ps", "--format", "json",
+        "--filter", f"label=managed-by={LABEL_MANAGED_BY}",
+        "--filter", f"label=role={LABEL_ROLE}"
+    ])
+    if output.strip():
+        return json.loads(output)
+    return []
 
 
 def scale_up(count: int):
     logger.info("Scaling up", extra={"count": count})
     for _ in range(count):
-        container = docker_client.containers.run(
-            PROCESSOR_IMAGE,
-            detach=True,
-            network=NETWORK_NAME,
-            labels={"managed-by": LABEL_MANAGED_BY, "role": LABEL_ROLE},
-            environment={
-                "RABBITMQ_HOST": "rabbitmq",
-                "RABBITMQ_USER": RABBITMQ_USER,
-                "RABBITMQ_PASS": RABBITMQ_PASS,
-            },
-            name=f"blob-processor-{int(time.time()*1000)}",
-        )
-        logger.info("Started container", extra={"id": container.id[:12]})
+        container_name = f"blob-processor-{int(time.time()*1000)}"
+        run_podman_command([
+            "run", "-d",
+            "--network", NETWORK_NAME,
+            "--label", f"managed-by={LABEL_MANAGED_BY}",
+            "--label", f"role={LABEL_ROLE}",
+            "-e", f"RABBITMQ_HOST=rabbitmq",
+            "-e", f"RABBITMQ_USER={RABBITMQ_USER}",
+            "-e", f"RABBITMQ_PASS={RABBITMQ_PASS}",
+            "--name", container_name,
+            PROCESSOR_IMAGE
+        ])
+        logger.info("Started container", extra={"name": container_name})
 
 
 def scale_down(count: int):
     logger.info("Scaling down", extra={"count": count})
     containers = list_processor_containers()[:count]
     for c in containers:
-        logger.info("Stopping container", extra={"id": c.id[:12]})
-        try:
-            c.stop(timeout=5)
-            c.remove()
-        except Exception as exc:
-            logger.exception("Failed to stop container", extra={"error": str(exc)})
+        container_id = c.get("Id", c.get("ID", ""))[:12]
+        if container_id:
+            logger.info("Stopping container", extra={"id": container_id})
+            try:
+                run_podman_command(["stop", "-t", "5", container_id])
+                run_podman_command(["rm", container_id])
+            except subprocess.CalledProcessError as exc:
+                logger.exception("Failed to stop container", extra={"error": str(exc)})
 
 # ---------------------------------------------------------------------------
 # Main loop

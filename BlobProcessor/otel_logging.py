@@ -1,30 +1,38 @@
 import logging
-import os
 import sys
-from typing import Tuple
+from typing import Tuple, Any
 
-from opentelemetry import trace  # type: ignore
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter  # type: ignore
-from opentelemetry.sdk.resources import SERVICE_NAME, Resource  # type: ignore
-from opentelemetry.sdk.trace import TracerProvider  # type: ignore
-from opentelemetry.sdk.trace.export import BatchSpanProcessor  # type: ignore
-from pythonjsonlogger import jsonlogger  # type: ignore
+import json
+from datetime import datetime
 
 
-def init_logging(service_name: str) -> Tuple[logging.Logger, trace.Tracer]:
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_entry = {
+            "asctime": datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3],
+            "levelname": record.levelname,
+            "name": record.name,
+            "message": record.getMessage(),
+            "taskName": None
+        }
+        
+        # Add extra fields if present
+        if hasattr(record, '__dict__'):
+            for key, value in record.__dict__.items():
+                if key not in ['name', 'msg', 'args', 'levelname', 'levelno', 'pathname', 'filename', 'module', 'exc_info', 'exc_text', 'stack_info', 'lineno', 'funcName', 'created', 'msecs', 'relativeCreated', 'thread', 'threadName', 'processName', 'process', 'getMessage', 'message']:
+                    log_entry[key] = value
+        
+        return json.dumps(log_entry)
+
+
+def init_logging(service_name: str) -> Tuple[logging.Logger, Any]:
     logger = logging.getLogger(service_name)
     if logger.handlers:
-        return logger, trace.get_tracer(__name__)
+        return logger, None
 
     logger.setLevel(logging.INFO)
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(jsonlogger.JsonFormatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    handler.setFormatter(JsonFormatter())
     logger.addHandler(handler)
-
-    resource = Resource(attributes={SERVICE_NAME: service_name})
-    provider = TracerProvider(resource=resource)
-    exporter = OTLPSpanExporter(endpoint=os.getenv("OTLP_ENDPOINT", "http://localhost:4317"), insecure=True)
-    provider.add_span_processor(BatchSpanProcessor(exporter))
-    trace.set_tracer_provider(provider)
-    tracer = trace.get_tracer(__name__)
-    return logger, tracer 
+    
+    return logger, None 

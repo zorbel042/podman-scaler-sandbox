@@ -21,10 +21,18 @@ def init_logging(service_name: str) -> Tuple[logging.Logger, trace.Tracer]:
     handler.setFormatter(jsonlogger.JsonFormatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     logger.addHandler(handler)
 
-    resource = Resource(attributes={SERVICE_NAME: service_name})
-    provider = TracerProvider(resource=resource)
-    exporter = OTLPSpanExporter(endpoint=os.getenv("OTLP_ENDPOINT", "http://localhost:4317"), insecure=True)
-    provider.add_span_processor(BatchSpanProcessor(exporter))
-    trace.set_tracer_provider(provider)
+    # Only setup OTEL tracing if endpoint is explicitly configured
+    otlp_endpoint = os.getenv("OTLP_ENDPOINT")
+    if otlp_endpoint:
+        resource = Resource(attributes={SERVICE_NAME: service_name})
+        provider = TracerProvider(resource=resource)
+        exporter = OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True)
+        provider.add_span_processor(BatchSpanProcessor(exporter))
+        trace.set_tracer_provider(provider)
+    else:
+        # Use no-op tracer provider to avoid connection attempts
+        provider = TracerProvider()
+        trace.set_tracer_provider(provider)
+    
     tracer = trace.get_tracer(__name__)
     return logger, tracer 

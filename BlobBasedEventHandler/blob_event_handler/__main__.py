@@ -9,13 +9,8 @@ from typing import List
 
 import pika
 from azure.storage.blob import BlobServiceClient, ContainerClient, BlobProperties  # type: ignore
-from opentelemetry import trace  # type: ignore
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter  # type: ignore
-from opentelemetry.sdk.resources import SERVICE_NAME, Resource  # type: ignore
-from opentelemetry.sdk.trace import TracerProvider  # type: ignore
-from opentelemetry.sdk.trace.export import BatchSpanProcessor  # type: ignore
-from pythonjsonlogger import jsonlogger  # type: ignore
 from otel_logging import init_logging
+from tenacity import retry, stop_after_attempt, wait_exponential  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Configuration via environment variables (with sensible defaults)
@@ -38,14 +33,16 @@ SERVICE_NAME_VALUE = os.getenv("OTEL_SERVICE_NAME", "BlobBasedEventHandler")
 # ---------------------------------------------------------------------------
 # Logging & Tracing setup
 # ---------------------------------------------------------------------------
-# initialize logging and tracing
-logger, tracer = init_logging(SERVICE_NAME_VALUE)
+# initialize logging
+logger, _ = init_logging(SERVICE_NAME_VALUE)
 
 # ---------------------------------------------------------------------------
 # RabbitMQ utilities
 # ---------------------------------------------------------------------------
 
+@retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=4, max=10))
 def get_rabbit_connection():
+    logger.info("Attempting to connect to RabbitMQ", extra={"host": RABBITMQ_HOST, "port": RABBITMQ_PORT})
     creds = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
     parameters = pika.ConnectionParameters(host=RABBITMQ_HOST, port=RABBITMQ_PORT, credentials=creds)
     return pika.BlockingConnection(parameters)
@@ -88,39 +85,38 @@ def main():
     channel = rabbit_conn.channel()
     ensure_queue(channel)
 
-    while True:
-        with tracer.start_as_current_span("poll_iteration"):
-            try:
-                blobs = list_blobs(container_client)
-                logger.info("Polled container", extra={"blob_count": len(blobs)})
+        while True:
+        try:
+            blobs = list_blobs(container_client)
+            logger.info("Polled container", extra={"blob_count": len(blobs)})
 
-                for blob in blobs:
-                    # Skip blobs already processed (simple heuristic)
-                    if blob.name.startswith("processed/"):
-                        continue
+            for blob in blobs:
+                # Skip blobs already processed (simple heuristic)
+                if blob.name.startswith("processed/"):
+                    continue
 
-                    path, _, name = blob.name.rpartition("/")
-                    msg_body = build_message(CONTAINER_NAME, path + "/" if path else "", name)
+                path, _, name = blob.name.rpartition("/")
+                msg_body = build_message(CONTAINER_NAME, path + "/" if path else "", name)
 
-                    channel.basic_publish(
-                        exchange="",
-                        routing_key=RABBITMQ_QUEUE,
-                        body=json.dumps(msg_body),
-                        properties=pika.BasicProperties(delivery_mode=2),  # persistent
-                    )
-                    logger.info("Published blob event", extra={"blob": blob.name})
-            except Exception as exc:
-                logger.exception("Error during poll iteration", extra={"error": str(exc)})
-                # Attempt to recreate RabbitMQ connection if necessary
-                if rabbit_conn.is_closed:
-                    try:
-                        rabbit_conn = get_rabbit_connection()
-                        channel = rabbit_conn.channel()
-                        ensure_queue(channel)
-                    except Exception:
-                        logger.exception("Failed to reconnect to RabbitMQ")
-            finally:
-                time.sleep(POLL_INTERVAL)
+                channel.basic_publish(
+                    exchange="",
+                    routing_key=RABBITMQ_QUEUE,
+                    body=json.dumps(msg_body),
+                    properties=pika.BasicProperties(delivery_mode=2),  # persistent
+                )
+                logger.info("Published blob event", extra={"blob": blob.name})
+        except Exception as exc:
+            logger.exception("Error during poll iteration", extra={"error": str(exc)})
+            # Attempt to recreate RabbitMQ connection if necessary
+            if rabbit_conn.is_closed:
+                try:
+                    rabbit_conn = get_rabbit_connection()
+                    channel = rabbit_conn.channel()
+                    ensure_queue(channel)
+                except Exception:
+                    logger.exception("Failed to reconnect to RabbitMQ")
+        finally:
+            time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,13 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+        curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -L -o /tmp/podman-remote.tar.gz https://github.com/containers/podman/releases/download/v4.8.0/podman-remote-static-linux_amd64.tar.gz \
+    && tar xzf /tmp/podman-remote.tar.gz -C /tmp \
+    && mv /tmp/bin/podman-remote-static-linux_amd64 /usr/local/bin/podman \
+    && chmod +x /usr/local/bin/podman \
+    && rm -rf /tmp/podman-remote.tar.gz /tmp/bin
 
 COPY requirements.txt ./
 RUN pip install -r requirements.txt

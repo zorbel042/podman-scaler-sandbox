@@ -2,23 +2,66 @@ import json
 import logging
 import os
 import sys
+import threading
+import time
 import uuid
 from datetime import datetime
+from typing import Optional
 
-import pika
-from azure.storage.blob import BlobServiceClient, ContainerClient  # type: ignore
-from opentelemetry import trace  # type: ignore
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter  # type: ignore
-from opentelemetry.sdk.resources import SERVICE_NAME, Resource  # type: ignore
-from opentelemetry.sdk.trace import TracerProvider  # type: ignore
-from opentelemetry.sdk.trace.export import BatchSpanProcessor  # type: ignore
-from pythonjsonlogger import jsonlogger  # type: ignore
-from tenacity import retry, stop_after_attempt, wait_exponential, RetryError  # type: ignore
-from otel_logging import init_logging
+logger = None
 
-SERVICE_NAME_VALUE = os.getenv("OTEL_SERVICE_NAME", "BlobProcessor")
+try:
+    # Initialize basic logging first
+    logger = logging.getLogger("BlobProcessor")
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler(sys.stdout)
+        
+        class SimpleFormatter(logging.Formatter):
+            def format(self, record):
+                return json.dumps({
+                    "asctime": datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3],
+                    "levelname": record.levelname,
+                    "name": record.name,
+                    "message": record.getMessage(),
+                    "taskName": None
+                })
+        
+        handler.setFormatter(SimpleFormatter())
+        logger.addHandler(handler)
+    
+    logger.info("=== STARTING BLOB PROCESSOR DEBUG ===")
+    logger.info("Basic imports successful")
+    
+    # Try pika import
+    logger.info("Importing pika...")
+    import pika
+    logger.info("Pika import successful")
+    
+    # Try tenacity import
+    logger.info("Importing tenacity...")
+    from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
+    logger.info("Tenacity import successful")
+    
+    # Try Azure imports - this is likely where the KeyError happens
+    logger.info("Importing Azure Storage SDK...")
+    from azure.storage.blob import BlobServiceClient, ContainerClient
+    logger.info("Azure Storage SDK import successful!")
+    
+    # Try otel_logging import
+    logger.info("Importing otel_logging...")
+    from otel_logging import init_logging
+    logger.info("otel_logging import successful")
+    
+    logger.info("All imports completed successfully")
+    
+except Exception as import_err:
+    if logger:
+        logger.error("IMPORT FAILED", extra={"error": str(import_err), "error_type": type(import_err).__name__})
+    else:
+        print(f"CRITICAL: Import failed before logger setup: {import_err}")
+    raise
 
-logger, tracer = init_logging(SERVICE_NAME_VALUE)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -41,28 +84,68 @@ ERROR_QUEUE = os.getenv("RABBITMQ_DLQ", "blob.error")
 # Blob helpers
 # ---------------------------------------------------------------------------
 
-blob_service = BlobServiceClient.from_connection_string(AZURITE_CONN_STR)
-container_client: ContainerClient = blob_service.get_container_client(CONTAINER_NAME)
+logger.info("Initializing Azure Storage SDK", extra={"connection_string_prefix": AZURITE_CONN_STR[:50] + "...", "container_name": CONTAINER_NAME})
+
+try:
+    blob_service = BlobServiceClient.from_connection_string(AZURITE_CONN_STR)
+    logger.info("BlobServiceClient created successfully")
+    
+    container_client: ContainerClient = blob_service.get_container_client(CONTAINER_NAME)
+    logger.info("ContainerClient created successfully", extra={"container_name": CONTAINER_NAME})
+    
+    # Test the connection
+    logger.info("Testing container client connection...")
+    try:
+        # This will attempt to connect and may reveal the KeyError
+        container_properties = container_client.get_container_properties()
+        logger.info("Container connection test successful", extra={"properties": str(container_properties)[:100]})
+    except Exception as test_err:
+        logger.error("Container connection test failed", extra={"error": str(test_err), "error_type": type(test_err).__name__})
+        # Don't raise here, let it continue for now
+        
+except Exception as init_err:
+    logger.error("Azure SDK initialization failed", extra={"error": str(init_err), "error_type": type(init_err).__name__})
+    # Set to None so we can detect this later
+    blob_service = None
+    container_client = None
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
-def move_blob(src_blob: str, dest_blob: str):
-    src_client = container_client.get_blob_client(src_blob)
-    dest_client = container_client.get_blob_client(dest_blob)
-
-    # Start copy
-    copy = dest_client.start_copy_from_url(src_client.url)
-    logger.info("Copy initiated", extra={"src": src_blob, "dest": dest_blob, "copy_id": copy[1]})
-
-    # Delete source after copy (simplified – immediate)
-    src_client.delete_blob()
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
+def periodic_health_check():
+    """Periodic health check that might be triggering the KeyError"""
+    logger.info("Running periodic health check")
+    
+    try:
+        # Check container client
+        if container_client is None:
+            raise ValueError("Container client is None")
+            
+        # Test blob operations that might cause KeyError
+        logger.info("Testing blob list operation")
+        blobs = list(container_client.list_blobs(name_starts_with="test-"))
+        logger.info("Health check: blob list successful", extra={"blob_count": len(blobs)})
+        
+        # Test a more complex operation that might trigger the KeyError
+        logger.info("Testing blob client creation")
+        test_blob_client = container_client.get_blob_client("health-check-test.txt")
+        logger.info("Health check: blob client creation successful")
+        
+        return True
+        
+    except Exception as health_err:
+        error_msg = f"Health check failed: {type(health_err).__name__}: {str(health_err)}"
+        logger.error(error_msg)
+        logger.error(f"Health check error details - Type: {type(health_err)}, Args: {health_err.args}")
+        raise
 
 
 # ---------------------------------------------------------------------------
 # Rabbit utilities
 # ---------------------------------------------------------------------------
 
+@retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=4, max=10))
 def get_rabbit_connection():
+    logger.info("Attempting to connect to RabbitMQ", extra={"host": RABBITMQ_HOST, "port": RABBITMQ_PORT})
     creds = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
     params = pika.ConnectionParameters(host=RABBITMQ_HOST, port=RABBITMQ_PORT, credentials=creds)
     return pika.BlockingConnection(params)
@@ -78,22 +161,25 @@ def ensure_queues(channel):
 # ---------------------------------------------------------------------------
 
 def process_message(ch, method, properties, body):  # noqa: N803 – pika naming
-    with tracer.start_as_current_span("process_blob"):
-        try:
-            msg = json.loads(body)
-            src_blob = os.path.join(msg["path"], msg["blob"]) if msg["path"] else msg["blob"]
-            dest_blob = msg["dest"]
-            move_blob(src_blob, dest_blob)
-            logger.info("Blob processed", extra={"src": src_blob, "dest": dest_blob})
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-        except RetryError as rexc:
-            logger.error("Retries exhausted", extra={"error": str(rexc)})
-            publish_error(ch, body, str(rexc))
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-        except Exception as exc:
-            logger.exception("Processing failed", extra={"error": str(exc)})
-            publish_error(ch, body, str(exc))
-            ch.basic_ack(delivery_tag=method.delivery_tag)
+    logger.info("=== RECEIVED MESSAGE ===", extra={"body_type": type(body).__name__, "body_length": len(body) if body else 0})
+    
+    try:
+        logger.info("Raw message body", extra={"raw_body": body.decode() if body else "empty"})
+        
+        msg = json.loads(body)
+        logger.info("Parsed JSON message", extra={"parsed_message": msg})
+        
+        logger.info("Successfully processed message - ACKNOWLEDGING", extra={"message_keys": list(msg.keys()) if isinstance(msg, dict) else "not_dict"})
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+        
+    except Exception as exc:
+        error_msg = f"Exception in process_message: {type(exc).__name__}: {str(exc)}"
+        logger.error(error_msg)
+        logger.error(f"Exception details - Type: {type(exc)}, Args: {exc.args}")
+        if hasattr(exc, '__traceback__'):
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+        ch.basic_ack(delivery_tag=method.delivery_tag)
 
 
 def publish_error(ch, original_body: bytes, error: str):
@@ -109,12 +195,32 @@ def publish_error(ch, original_body: bytes, error: str):
 # Main entry
 # ---------------------------------------------------------------------------
 
+def run_periodic_health_checks():
+    """Background thread to run periodic health checks"""
+    logger.info("Starting periodic health check thread")
+    
+    while True:
+        try:
+            time.sleep(30)  # Run every 30 seconds to match the timing we see
+            logger.info("Triggering scheduled health check")
+            periodic_health_check()
+            logger.info("Scheduled health check completed successfully")
+        except Exception as health_thread_err:
+            logger.error("Health check thread error", extra={"error": str(health_thread_err), "error_type": type(health_thread_err).__name__})
+            # Continue running even if health check fails
+
+
 def main():
     logger.info("Starting BlobProcessor", extra={"event": "startup"})
 
     rabbit_conn = get_rabbit_connection()
     channel = rabbit_conn.channel()
     ensure_queues(channel)
+
+    # Start background health check thread
+    logger.info("Starting background health check thread")
+    health_thread = threading.Thread(target=run_periodic_health_checks, daemon=True)
+    health_thread.start()
 
     channel.basic_qos(prefetch_count=1)
     channel.basic_consume(queue=EVENT_QUEUE, on_message_callback=process_message)

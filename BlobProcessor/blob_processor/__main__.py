@@ -110,9 +110,56 @@ except Exception as init_err:
     container_client = None
 
 
+# ---------------------------------------------------------------------------
+# Blob processing functions
+# ---------------------------------------------------------------------------
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
+def move_blob(src_blob: str, dest_blob: str):
+    """Move a blob from source to destination path with retry logic."""
+    try:
+        logger.info("Starting blob move operation", extra={"src": src_blob, "dest": dest_blob})
+        
+        # Check if container_client is properly initialized
+        if not container_client:
+            raise ValueError("Container client not initialized")
+        
+        logger.info("Getting blob clients for source and destination")
+        src_client = container_client.get_blob_client(src_blob)
+        dest_client = container_client.get_blob_client(dest_blob)
+        
+        logger.info("Blob clients created", extra={"src_url": src_client.url})
+
+        # Start copy operation
+        logger.info("Starting blob copy operation")
+        try:
+            copy_info = dest_client.start_copy_from_url(src_client.url)
+            logger.info("Copy operation initiated", extra={"copy_id": copy_info.get("copy_id")})
+            
+            # Wait for copy to complete (for small files this should be instant)
+            copy_status = dest_client.get_blob_properties().copy.status
+            logger.info("Copy operation completed", extra={"copy_status": copy_status})
+            
+            if copy_status == "success":
+                # Delete the source blob after successful copy
+                logger.info("Deleting source blob after successful copy")
+                src_client.delete_blob()
+                logger.info("Blob move completed successfully", extra={"src": src_blob, "dest": dest_blob})
+            else:
+                raise Exception(f"Copy operation failed with status: {copy_status}")
+                
+        except Exception as copy_err:
+            logger.error("Copy operation failed", extra={"error": str(copy_err), "error_type": type(copy_err).__name__})
+            raise
+            
+    except Exception as move_err:
+        logger.error("Blob move operation failed", extra={"src": src_blob, "dest": dest_blob, "error": str(move_err), "error_type": type(move_err).__name__})
+        raise
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
 def periodic_health_check():
-    """Periodic health check that might be triggering the KeyError"""
+    """Periodic health check to verify system components."""
     logger.info("Running periodic health check")
     
     try:
@@ -120,12 +167,12 @@ def periodic_health_check():
         if container_client is None:
             raise ValueError("Container client is None")
             
-        # Test blob operations that might cause KeyError
+        # Test blob operations
         logger.info("Testing blob list operation")
         blobs = list(container_client.list_blobs(name_starts_with="test-"))
         logger.info("Health check: blob list successful", extra={"blob_count": len(blobs)})
-        
-        # Test a more complex operation that might trigger the KeyError
+
+        # Test blob client creation
         logger.info("Testing blob client creation")
         test_blob_client = container_client.get_blob_client("health-check-test.txt")
         logger.info("Health check: blob client creation successful")
@@ -169,8 +216,51 @@ def process_message(ch, method, properties, body):  # noqa: N803 – pika naming
         msg = json.loads(body)
         logger.info("Parsed JSON message", extra={"parsed_message": msg})
         
-        logger.info("Successfully processed message - ACKNOWLEDGING", extra={"message_keys": list(msg.keys()) if isinstance(msg, dict) else "not_dict"})
+        # Validate required message fields
+        required_keys = ["path", "blob", "dest"]
+        missing_keys = [key for key in required_keys if key not in msg]
+        if missing_keys:
+            raise KeyError(f"Missing required keys: {missing_keys}")
+        
+        # Build source and destination blob paths
+        src_blob = os.path.join(msg["path"], msg["blob"]) if msg["path"] else msg["blob"]
+        
+        # Create processed path - move files to "processed/" folder
+        if src_blob.startswith("sample/"):
+            # Move from sample/ to processed/sample/
+            dest_blob = src_blob.replace("sample/", "processed/sample/", 1)
+        else:
+            # For other paths, add processed/ prefix
+            dest_blob = f"processed/{src_blob}"
+        
+        logger.info("Processing blob movement", extra={
+            "src_blob": src_blob, 
+            "dest_blob": dest_blob,
+            "container": msg.get("container", "unknown")
+        })
+        
+        # Perform the blob move operation
+        move_blob(src_blob, dest_blob)
+        
+        logger.info("Blob processing completed successfully", extra={
+            "src_blob": src_blob,
+            "dest_blob": dest_blob
+        })
+        
+        # Acknowledge the message only after successful processing
         ch.basic_ack(delivery_tag=method.delivery_tag)
+        
+    except json.JSONDecodeError as json_err:
+        error_msg = f"JSON decode error: {str(json_err)}"
+        logger.error(error_msg)
+        publish_error(ch, ERROR_QUEUE, json_err, {"raw_body": body.decode() if body else "empty"})
+        ch.basic_ack(delivery_tag=method.delivery_tag)  # Ack to avoid reprocessing bad JSON
+        
+    except KeyError as key_err:
+        error_msg = f"Missing required message fields: {str(key_err)}"
+        logger.error(error_msg)
+        publish_error(ch, ERROR_QUEUE, key_err, msg if 'msg' in locals() else {})
+        ch.basic_ack(delivery_tag=method.delivery_tag)  # Ack to avoid reprocessing bad messages
         
     except Exception as exc:
         error_msg = f"Exception in process_message: {type(exc).__name__}: {str(exc)}"
@@ -179,16 +269,37 @@ def process_message(ch, method, properties, body):  # noqa: N803 – pika naming
         if hasattr(exc, '__traceback__'):
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        # Publish error and decide whether to acknowledge or reject
+        publish_error(ch, ERROR_QUEUE, exc, msg if 'msg' in locals() else {})
+        
+        # For transient errors, we might want to retry, but for now, acknowledge to prevent infinite loops
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
 
-def publish_error(ch, original_body: bytes, error: str):
+def publish_error(channel, error_queue: str, error: Exception, failed_message: dict):
+    """Publish error information to error queue."""
     try:
-        error_msg = json.loads(original_body)
-    except json.JSONDecodeError:
-        error_msg = {"raw": original_body.decode()}
-    error_msg.update({"error": error, "failed_at": datetime.utcnow().isoformat() + "Z"})
-    ch.basic_publish(exchange="", routing_key=ERROR_QUEUE, body=json.dumps(error_msg), properties=pika.BasicProperties(delivery_mode=2))
+        logger.info("Publishing error to error queue", extra={"queue": error_queue, "error_type": type(error).__name__})
+        
+        error_msg = {
+            "error": str(error),
+            "error_type": type(error).__name__,
+            "failed_message": failed_message,
+            "failed_at": datetime.now(datetime.UTC).isoformat(),
+            "processor_id": str(uuid.uuid4())
+        }
+        
+        channel.basic_publish(
+            exchange="",
+            routing_key=error_queue,
+            body=json.dumps(error_msg),
+            properties=pika.BasicProperties(delivery_mode=2)  # persistent
+        )
+        logger.info("Error published to queue successfully")
+        
+    except Exception as pub_err:
+        logger.error("Failed to publish error to queue", extra={"error": str(pub_err)})
 
 
 # ---------------------------------------------------------------------------

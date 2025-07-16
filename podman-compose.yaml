@@ -70,27 +70,8 @@ services:
       start_period: 40s
     # If you are running **rootless Podman on another host**, adjust the UID portion accordingly.
 
-  blob-processor:
-    build:
-      context: ./BlobProcessor
-    image: localhost/sandboxtest/blob-processor:latest
-    networks:
-      - app-network
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      RABBITMQ_USER: ic-tester
-      RABBITMQ_PASS: ic-tester
-      RABBITMQ_PORT: 5672
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python", "-c", "import pika; pika.BlockingConnection(pika.ConnectionParameters('rabbitmq', 5672, credentials=pika.PlainCredentials('ic-tester', 'ic-tester')))"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-    # Note: To run multiple instances, use: podman-compose up --scale blob-processor=3
+  # blob-processor service removed - now managed dynamically by keda-test-scaler
+  # Each processor instance handles exactly one message then terminates
 
   azurite:
     image: mcr.microsoft.com/azure-storage/azurite:latest

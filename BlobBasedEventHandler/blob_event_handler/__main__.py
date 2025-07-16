@@ -85,14 +85,22 @@ def main():
     channel = rabbit_conn.channel()
     ensure_queue(channel)
 
-        while True:
+    # Track which blobs have been queued to prevent requeuing
+    queued_blobs = set()
+
+    while True:
         try:
             blobs = list_blobs(container_client)
             logger.info("Polled container", extra={"blob_count": len(blobs)})
 
+            new_blobs_found = 0
             for blob in blobs:
                 # Skip blobs already processed (simple heuristic)
                 if blob.name.startswith("processed/"):
+                    continue
+
+                # Skip blobs that have already been queued
+                if blob.name in queued_blobs:
                     continue
 
                 path, _, name = blob.name.rpartition("/")
@@ -104,7 +112,17 @@ def main():
                     body=json.dumps(msg_body),
                     properties=pika.BasicProperties(delivery_mode=2),  # persistent
                 )
+                
+                # Track that we've queued this blob
+                queued_blobs.add(blob.name)
+                new_blobs_found += 1
                 logger.info("Published blob event", extra={"blob": blob.name})
+
+            if new_blobs_found > 0:
+                logger.info("Published new blob events", extra={"new_blobs": new_blobs_found, "total_queued": len(queued_blobs)})
+            else:
+                logger.info("No new blobs to queue", extra={"total_queued": len(queued_blobs)})
+
         except Exception as exc:
             logger.exception("Error during poll iteration", extra={"error": str(exc)})
             # Attempt to recreate RabbitMQ connection if necessary

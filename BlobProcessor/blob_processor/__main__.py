@@ -250,17 +250,26 @@ def process_message(ch, method, properties, body):  # noqa: N803 – pika naming
         # Acknowledge the message only after successful processing
         ch.basic_ack(delivery_tag=method.delivery_tag)
         
+        # CRITICAL: Exit after processing one message (single-job mode)
+        logger.info("Single message processed successfully - terminating container", extra={"message_processed": True})
+        ch.stop_consuming()  # Stop consuming more messages
+        return True  # Signal successful completion
+        
     except json.JSONDecodeError as json_err:
         error_msg = f"JSON decode error: {str(json_err)}"
         logger.error(error_msg)
         publish_error(ch, ERROR_QUEUE, json_err, {"raw_body": body.decode() if body else "empty"})
         ch.basic_ack(delivery_tag=method.delivery_tag)  # Ack to avoid reprocessing bad JSON
+        ch.stop_consuming()  # Exit even on error
+        return False
         
     except KeyError as key_err:
         error_msg = f"Missing required message fields: {str(key_err)}"
         logger.error(error_msg)
         publish_error(ch, ERROR_QUEUE, key_err, msg if 'msg' in locals() else {})
         ch.basic_ack(delivery_tag=method.delivery_tag)  # Ack to avoid reprocessing bad messages
+        ch.stop_consuming()  # Exit even on error
+        return False
         
     except Exception as exc:
         error_msg = f"Exception in process_message: {type(exc).__name__}: {str(exc)}"
@@ -275,6 +284,8 @@ def process_message(ch, method, properties, body):  # noqa: N803 – pika naming
         
         # For transient errors, we might want to retry, but for now, acknowledge to prevent infinite loops
         ch.basic_ack(delivery_tag=method.delivery_tag)
+        ch.stop_consuming()  # Exit even on error
+        return False
 
 
 def publish_error(channel, error_queue: str, error: Exception, failed_message: dict):
@@ -322,22 +333,32 @@ def run_periodic_health_checks():
 
 
 def main():
-    logger.info("Starting BlobProcessor", extra={"event": "startup"})
+    logger.info("Starting BlobProcessor in single-job mode", extra={"event": "startup", "mode": "single_message"})
 
     rabbit_conn = get_rabbit_connection()
     channel = rabbit_conn.channel()
     ensure_queues(channel)
 
-    # Start background health check thread
-    logger.info("Starting background health check thread")
-    health_thread = threading.Thread(target=run_periodic_health_checks, daemon=True)
-    health_thread.start()
+    # No health check thread needed for single-job mode
+    logger.info("Configured for single message processing - no background threads")
 
-    channel.basic_qos(prefetch_count=1)
+    channel.basic_qos(prefetch_count=1)  # Process one message at a time
     channel.basic_consume(queue=EVENT_QUEUE, on_message_callback=process_message)
 
-    logger.info("Waiting for messages", extra={"queue": EVENT_QUEUE})
-    channel.start_consuming()
+    logger.info("Waiting for single message", extra={"queue": EVENT_QUEUE})
+    try:
+        channel.start_consuming()
+        logger.info("Message processing completed - container will now terminate")
+    except Exception as consume_err:
+        logger.error("Error during message consumption", extra={"error": str(consume_err)})
+    finally:
+        try:
+            rabbit_conn.close()
+            logger.info("RabbitMQ connection closed")
+        except Exception as close_err:
+            logger.error("Error closing connection", extra={"error": str(close_err)})
+        
+        logger.info("BlobProcessor terminating", extra={"event": "shutdown"})
 
 
 if __name__ == "__main__":
